@@ -65,3 +65,8 @@ Feeds Urban Pulse scenario / forecast layers. Upstream detections may come from 
 ## License
 
 MIT
+
+## Security & methodology
+
+See [`SECURITY.md`](SECURITY.md) and [`docs/PROJECT_METHODOLOGY.md`](docs/PROJECT_METHODOLOGY.md).
+

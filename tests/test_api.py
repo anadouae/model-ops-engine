@@ -97,6 +97,28 @@ def test_predict_validation(trained: dict):
         assert bad.status_code == 422
 
 
+def test_predict_requires_api_key_when_configured(trained: dict, monkeypatch: pytest.MonkeyPatch):
+    from model_ops_engine import config
+    from model_ops_engine.api import create_app
+
+    monkeypatch.setattr(config.settings, "api_key", "demo-secret")
+    app = create_app(model_dir=Path(trained["dir"]))
+    payload = {
+        "vehicle_count": 10,
+        "pedestrian_count": 1,
+        "avg_speed_kmh": 30.0,
+        "occupancy_ratio": 0.4,
+        "hour_of_day": 12,
+        "is_weekend": 0,
+        "rain_mm": 0.0,
+    }
+    with TestClient(app) as client:
+        assert client.post("/predict", json=payload).status_code == 401
+        ok = client.post("/predict", json=payload, headers={"X-API-Key": "demo-secret"})
+        assert ok.status_code == 200
+
+
+
 def test_meta_json_roundtrip(trained: dict):
     meta_path = Path(trained["dir"]) / "model_meta.json"
     data = json.loads(meta_path.read_text(encoding="utf-8"))

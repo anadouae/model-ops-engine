@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import joblib
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from model_ops_engine import __version__
@@ -40,7 +42,6 @@ def _load_model(model_dir: Path) -> tuple[Any, dict]:
     path = model_dir / "congestion_gbr.joblib"
     meta_path = model_dir / "model_meta.json"
     if not path.exists():
-        # Train on the fly for first boot / CI
         from model_ops_engine.train import train
 
         logger.info("No artifact found — training a fresh model into %s", model_dir)
@@ -53,6 +54,14 @@ def _load_model(model_dir: Path) -> tuple[Any, dict]:
     return model, meta
 
 
+def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    expected = (settings.api_key or "").strip()
+    if not expected:
+        return
+    if not x_api_key or not secrets.compare_digest(x_api_key.strip(), expected):
+        raise HTTPException(status_code=401, detail="Valid X-API-Key required")
+
+
 def create_app(model_dir: Path | None = None) -> FastAPI:
     state: dict[str, Any] = {}
 
@@ -62,6 +71,12 @@ def create_app(model_dir: Path | None = None) -> FastAPI:
         model, meta = _load_model(directory)
         state["model"] = model
         state["meta"] = meta
+        if not (settings.api_key or "").strip():
+            logger.warning(
+                "SECURITY: API_KEY empty — /predict is open (local demo). Set API_KEY for hardened demos."
+            )
+        else:
+            logger.info("SECURITY: X-API-Key required on /predict")
         logger.info("Model ready: %s", meta.get("model_name", settings.model_name))
         yield
         state.clear()
@@ -75,6 +90,23 @@ def create_app(model_dir: Path | None = None) -> FastAPI:
         ),
         lifespan=lifespan,
     )
+
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["*"],
+        )
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -93,15 +125,16 @@ def create_app(model_dir: Path | None = None) -> FastAPI:
         }
 
     @app.post("/predict", response_model=PredictResponse)
-    def predict(body: PredictRequest) -> PredictResponse:
+    def predict(
+        body: PredictRequest,
+        _: None = Depends(_require_api_key),
+    ) -> PredictResponse:
         import pandas as pd
 
         model = state.get("model")
         if model is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
-        row = pd.DataFrame(
-            [{col: getattr(body, col) for col in FEATURE_COLUMNS}]
-        )
+        row = pd.DataFrame([{col: getattr(body, col) for col in FEATURE_COLUMNS}])
         score = float(model.predict(row)[0])
         score = max(0.0, min(1.0, score))
         meta = state.get("meta") or {}
@@ -119,7 +152,6 @@ app = create_app()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         "model_ops_engine.api:app",
         host=settings.host,
